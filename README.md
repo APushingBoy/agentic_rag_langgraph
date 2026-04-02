@@ -1,0 +1,2 @@
+# agentic_rag_langgraph
+实现基于LangGraph的Agentic RAG系统，用于从长PDF中检索并回答。更多功能还在不断完善中。
