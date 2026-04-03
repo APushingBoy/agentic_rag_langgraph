@@ -1,4 +1,28 @@
+## 放一个mermaid图看看
 
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+        __start__([<p>__start__</p>]):::first
+        agent(agent)
+        tools(tools)
+        evaluator(evaluator)
+        __end__([<p>__end__</p>]):::last
+        __start__ --> agent;
+        agent -. &nbsp;end&nbsp; .-> __end__;
+        agent -. &nbsp;reflect&nbsp; .-> evaluator;
+        agent -. &nbsp;continue&nbsp; .-> tools;
+        evaluator -. &nbsp;end&nbsp; .-> __end__;
+        evaluator -. &nbsp;re-think&nbsp; .-> agent;
+        tools --> agent;
+        classDef default fill:#f2f0ff,line-height:1.2
+        classDef first fill-opacity:0
+        classDef last fill:#bfb6fc
+```
 
 ##  项目简介
 
