@@ -1,5 +1,5 @@
 ## 放一个mermaid图看看
-
+最开始的版本
 ```mermaid
 ---
 config:
@@ -23,7 +23,33 @@ graph TD;
         classDef first fill-opacity:0
         classDef last fill:#bfb6fc
 ```
-
+加上planner以后
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+        __start__([<p>__start__</p>]):::first
+        planner(planner)
+        agent(agent)
+        tools(tools)
+        evaluator(evaluator)
+        __end__([<p>__end__</p>]):::last
+        __start__ --> planner;
+        agent -. &nbsp;end&nbsp; .-> __end__;
+        agent -. &nbsp;reflect&nbsp; .-> evaluator;
+        agent -. &nbsp;continue&nbsp; .-> tools;
+        evaluator -. &nbsp;end&nbsp; .-> __end__;
+        evaluator -. &nbsp;re-think&nbsp; .-> planner;
+        planner -. &nbsp;end&nbsp; .-> __end__;
+        planner -.-> agent;
+        tools --> agent;
+        classDef default fill:#f2f0ff,line-height:1.2
+        classDef first fill-opacity:0
+        classDef last fill:#bfb6fc
+```
 ##  项目简介
 
 本项目实现了一个面向 PDF 文档问答的 **Agentic RAG（检索增强生成）系统**。
