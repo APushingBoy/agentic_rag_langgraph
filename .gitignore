@@ -1,0 +1,12 @@
+# 忽略真正的私密环境文件
+.env
+
+# 忽略 documents 文件夹下的所有具体文件（比如 PDF）
+# 但通过感叹号 (!) 排除掉 .gitkeep，让它被追踪
+documents/*
+!.gitkeep
+
+# 其他常规忽略
+__pycache__/
+.vscode/
+*.pyc
