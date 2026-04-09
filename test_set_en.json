@@ -1,0 +1,42 @@
+[
+  {
+    "question": "According to the document, what is the key architectural innovation in SAM 2 that enables it to handle temporal dependencies in video segmentation, and how does it differ when applied to static images?",
+    "ground_truth": "SAM 2 is equipped with a memory that stores information about the object and previous interactions, allowing it to generate and correct masklet predictions throughout the video using a memory attention module. When applied to images, the memory is empty and the model behaves like SAM."
+  },
+  {
+    "question": "The SA-V dataset is described as 'geographically diverse' and fairness-evaluated across perceived demographic attributes. What specific fairness findings are reported regarding performance discrepancy based on perceived gender and age groups?",
+    "ground_truth": "A fairness evaluation of SAM 2 indicates minimal performance discrepancy in video segmentation based on perceived gender, and little variance among the three perceived age groups evaluated."
+  },
+  {
+    "question": "How does SAM 2’s data engine achieve an 8.4× speedup over Phase 1 (SAM-per-frame) in annotation time per frame, and what architectural capability of SAM 2 enables this efficiency gain?",
+    "ground_truth": "SAM 2’s data engine achieves an 8.4× speedup over Phase 1 by enabling annotators to provide only occasional refinement clicks instead of annotating masks from scratch in every frame — made possible by SAM 2’s memory that retains information about past predictions and object pointers across frames."
+  },
+  {
+    "question": "In the Promptable Visual Segmentation (PVS) task, what are the three types of prompts accepted by SAM 2, on which frames can they be provided, and what is the functional purpose of iterative prompting across frames?",
+    "ground_truth": "SAM 2 accepts points, boxes, or masks as prompts on any frame of the video to define or refine a segment of interest; iterative prompting allows the model to refine predicted masklets throughout the video based on user feedback in additional frames."
+  },
+  {
+    "question": "Compare SAM 2’s performance on image segmentation benchmarks to the original SAM: what are the exact mIoU scores with 1-click prompts on the SA-23 datasets, and what factor is cited as the primary reason for SAM 2’s improved accuracy and speed?",
+    "ground_truth": "SAM 2 achieves 58.9 mIoU with 1 click on the SA-23 datasets, compared to SAM’s 58.1 mIoU; this improvement is attributed to the smaller but more effective Hiera image encoder in SAM 2, which also enables it to be 6× faster."
+  },
+  {
+    "question": "What is the total number of masks in the SA-V dataset, and how does this quantity compare quantitatively to the largest existing video segmentation dataset? Specify both the overall multiplier and the multiplier excluding auto-generated annotations.",
+    "ground_truth": "The SA-V dataset contains 35.5M masks, which is 53× more masks than any existing video segmentation dataset; excluding auto annotations, it is 15× larger."
+  },
+  {
+    "question": "Section 5.2 states that SA-V has a 'disappearance rate' of 42.5% in its manual masklets. What definition of 'disappearance rate' is used in the document, and which prior work is cited as the source of this metric?",
+    "ground_truth": "The disappearance rate is defined as 'the percentage of annotated masklets that disappear in at least one frame and then re-appear', and it is cited from Ding et al., 2023."
+  },
+  {
+    "question": "SAM 2 is trained jointly on image and video data using simulated interactive prompting. Describe the exact composition of initial prompts during training: what are the three possible prompt types, and what are their respective probabilities of being sampled?",
+    "ground_truth": "Initial prompts to the model during training are: the ground-truth mask with probability 0.5, a positive click sampled from the ground-truth mask with probability 0.25, or a bounding box input with probability 0.25."
+  },
+  {
+    "question": "In the context of semi-supervised Video Object Segmentation (VOS), how does the document characterize the relationship between VOS and the proposed Promptable Visual Segmentation (PVS) task? Specifically, why is VOS considered a 'special case' of PVS, and what practical limitation of VOS is highlighted?",
+    "ground_truth": "Semi-supervised VOS is considered a special case of the PVS task with only a mask prompt in the first video frame; the document highlights that annotating the required high-quality object mask in the first frame is practically challenging and time-consuming for inference."
+  },
+  {
+    "question": "What are the two distinct components stored in SAM 2’s memory bank, and how does the model use each component — particularly distinguishing between spatial memories and object pointers — during memory attention?",
+    "ground_truth": "The memory bank stores (1) a FIFO queue of memories of up to N recent frames and up to M prompted frames — stored as spatial feature maps — and (2) a list of object pointers as lightweight vectors encoding high-level semantic information of the object, derived from mask decoder output tokens; memory attention cross-attends to both spatial memory features and these object pointers."
+  }
+]

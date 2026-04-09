@@ -1,0 +1,42 @@
+[
+  {
+    "question": "SAM 2 相比于原始 SAM，在图像分割基准测试中的性能提升和推理速度变化具体是多少？请结合文档中实验部分的数据说明。",
+    "ground_truth": "SAM 2 在图像分割基准测试中，使用 1 次点击（1-click）时 mIoU 达到 58.9，高于 SAM 的 58.1；同时推理速度是 SAM 的 6 倍（即快 6×）。"
+  },
+  {
+    "question": "SA-V 数据集在掩码数量上相较于现有视频分割数据集有何优势？该优势是否包含自动标注部分？请引用原文数据说明。",
+    "ground_truth": "SA-V 数据集包含 35.5M 掩码，是任何现有视频分割数据集的 53×；该 53× 优势包含自动标注部分，原文明确指出‘53× (15× without auto) more masks than any existing VOS dataset’。"
+  },
+  {
+    "question": "SAM 2 的内存机制如何支持跨帧交互式修正？请从记忆存储内容、访问方式及时间信息嵌入三个角度综合概括。",
+    "ground_truth": "SAM 2 的内存机制包含：（1）记忆存储内容——维护两个 FIFO 队列，分别存储最多 N 帧的近期预测记忆（空间特征图）和最多 M 帧的提示帧记忆，并额外存储轻量级物体指针（基于掩码解码头输出）；（2）访问方式——通过记忆注意力模块对当前帧特征进行自注意力与跨注意力（作用于记忆库中的空间记忆和物体指针）；（3）时间信息嵌入——仅对 N 帧近期记忆嵌入时间位置信息以建模短期运动，不对提示帧记忆嵌入时间信息。"
+  },
+  {
+    "question": "在数据引擎第三阶段（SAM 2 全功能版），人工标注效率相比第一阶段提升了多少倍？该阶段标注每帧平均耗时是多少秒？",
+    "ground_truth": "第三阶段标注效率是第一阶段的 8.4×，即快 8.4 倍；该阶段标注每帧平均耗时为 4.5 秒。"
+  },
+  {
+    "question": "Promptable Visual Segmentation（PVS）任务与传统半监督视频目标分割（semi-supervised VOS）任务的核心区别是什么？请从输入提示形式、适用范围和实际标注难度三方面回答。",
+    "ground_truth": "核心区别在于：（1）输入提示形式——PVS 允许在任意视频帧上提供点、框或掩码提示（不限于首帧），而 semi-supervised VOS 仅接受首帧的掩码作为输入；（2）适用范围——PVS 是更通用的任务，semi-supervised VOS 仅是其特例（仅首帧掩码提示）；（3）实际标注难度——VOS 要求首帧提供高质量对象掩码，实践上具有挑战性且耗时，而 PVS 支持多帧灵活提示与迭代修正。"
+  },
+  {
+    "question": "SA-V 数据集在公平性评估中关于感知性别和年龄的表现如何？请用原文原句回答。",
+    "ground_truth": "‘a fairness evaluation of SAM 2 indicates minimal performance discrepancy in video segmentation based on perceived gender, and little variance among the three perceived age groups we evaluated.’"
+  },
+  {
+    "question": "SAM 2 的图像编码器采用什么预训练模型和架构？为何选择该架构？",
+    "ground_truth": "SAM 2 的图像编码器采用 MAE（He et al., 2022）预训练的 Hiera（Ryali et al., 2023; Bolya et al., 2023）架构；选择该架构是因为其具有层次化结构，支持在解码过程中使用多尺度特征。"
+  },
+  {
+    "question": "在 SA-V 数据集构建中，验证环节如何处理质量不合格的掩码序列（masklet）？是否会对所有类型的问题掩码都进行返工？",
+    "ground_truth": "验证环节将掩码序列分为‘satisfactory’（正确且一致跟踪目标）或‘unsatisfactory’（目标定义清晰但跟踪不正确/不一致）两类；‘unsatisfactory’掩码序列会被退回标注流水线进行修正；而‘跟踪未明确定义对象’的掩码序列则被完全拒绝，不返工。"
+  },
+  {
+    "question": "SAM 2 训练过程中模拟交互提示的具体策略是什么？包括帧序列长度、提示帧数量、初始提示类型及其概率分布。",
+    "ground_truth": "训练中采样 8 帧序列，随机选择最多 2 帧进行提示；初始提示以 0.5 概率使用真实掩码、0.25 概率使用从真实掩码中采样的正向点击、0.25 概率使用边界框输入。"
+  },
+  {
+    "question": "为什么作者认为现有视频分割数据集无法支撑‘segment anything in videos’能力？请从标注粒度、类别覆盖和规模三方面总结原文依据。",
+    "ground_truth": "因为现有视频分割数据集：（1）标注粒度上通常只覆盖完整对象而非部件或子部件；（2）类别覆盖上常围绕特定对象类别（如人、车辆、动物），缺乏通用性；（3）规模上远小于 SA-V（SA-V 掩码数是现有最大 VOS 数据集的 53×）。"
+  }
+]

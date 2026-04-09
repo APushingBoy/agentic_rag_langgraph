@@ -1,3 +1,8 @@
+"""
+第8个版本：
+离线读取文档库并存入向量数据库，新增了ingestion_pipeline.py
+相应地修改了main.py和rag_tools.py的逻辑
+"""
 # ==========================================
 # 1. 基础环境与 RAG 引擎准备
 # ==========================================
@@ -37,7 +42,7 @@ def select_file():
     return None
 
 
-SELECTED_PDF_PATH = select_file()
+SELECTED_PDF_PATH = os.getenv("SELECTED_PDF_PATH") or select_file()
 if not SELECTED_PDF_PATH:
     console.print("[bold red] 未选择有效文件，程序退出。[/bold red]")
     exit()

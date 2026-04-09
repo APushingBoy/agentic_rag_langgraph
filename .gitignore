@@ -10,3 +10,6 @@ documents/*
 __pycache__/
 .vscode/
 *.pyc
+
+final_report.csv
+v8_agent_results_raw.json
