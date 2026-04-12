@@ -1,166 +1,58 @@
-# Agentic RAG — PDF Knowledge QA System
+# Agentic RAG 系统 V8 版本 - 深度混合检索与离线元数据驱动架构
 
-> 基于 LangGraph 构建的多节点 Agentic RAG 系统，实现对本地 PDF 文档的智能问答。
-> 项目经历了从手动 Pipeline 到 LlamaIndex 框架重构、从单路向量检索到混合检索的完整演进，核心目标是将 RAG 作为**系统设计问题**而非 API 调用来对待。
+本项目是一个基于 LangGraph 构建的高性能 Agentic RAG 系统。V8 版本通过“离线化索引”与“混合检索”双引擎驱动，配合智能路由与反思评估机制，实现了极高的工业级问答准确度，并原生支持 LangSmith 全链路监控。
 
----
+##  核心特性
 
-## 系统架构
+### 1. 深度混合检索引擎 (Hybrid Search)
+系统集成了双路检索机制，确保在各种查询场景下的召回率：
+- **BM25 关键词检索**：针对专有名词、产品型号、缩写等精确匹配场景表现卓越。
+- **Vector 语义检索**：基于 HuggingFace 嵌入模型，捕捉用户问题的深层语义意图。
+- **重排序 (Rerank)**：采用 Cross-Encoder 对双路结果进行二次打分，确保最相关的上下文排在首位。
 
-```
-用户输入
-   │
-   ▼
-┌──────────┐
-│  Planner │  判断意图：需要检索 or 直接回答
-└──────────┘
-   │
-   ▼
-┌──────────┐   调用工具     ┌──────────────────────┐
-│  Agent   │ ────────────▶ │  Tools               │
-│  执行层   │               │  search_pdf_tool     │
-└──────────┘ ◀──────────── │  submit_final_answer │
-   │          工具结果      └──────────────────────┘
-   │
-   │  submit_final_answer
-   ▼
-┌──────────┐
-│ Evaluator│  Faithfulness 检验，不合格回退 Planner
-└──────────┘
-   │
-   ├── pass → END
-   └── fail → Planner（最多3轮）
-```
+### 2. V8 离线化元数据架构
+- **Manifest 驱动**：彻底放弃实时路径输入。系统通过 `manifest.json` 管理文档库，包含每篇文档的摘要、关键词和核心要点。
+- **智能路由 (Smart Routing)**：Planner 节点在检索前会根据元数据自动锁定目标 `doc_id`，避免在无关文档中浪费检索额度。
 
-| 节点 | 职责 |
-|------|------|
-| **Planner** | 只看当前用户输入，判断是否需要检索，指定工具名。最小权限设计，不接触历史消息，不生成答案 |
-| **Agent** | 根据 Planner 决策执行。`action=tool` 时使用 `llm_with_tools`，`action=respond` 时使用 `llm_plain`，避免 Forced Tool Calling |
-| **Tools** | 执行 RAG 检索，校验工具调用是否符合 Planner 预期，拒绝越权调用并将原因写回消息历史 |
-| **Evaluator** | 独立 LLM 做 Faithfulness 检验，通过 `tool_call_id` 精确匹配检索文档，不合格时回退 Planner 重新规划 |
+### 3. Agentic 闭环评估机制
+- **Planner 节点**：负责多步规划，决定是直接回复、列出目录还是执行深度混合检索。
+- **Evaluator 节点**：独立的反思模块，对生成的答案进行“事实性冲突”检验。若检索结果为空或答案置信度不足，系统将触发重试或严格执行拒绝回答策略。
 
----
+### 4. 全方位可观测性 (LangSmith)
+- 原生集成 **LangSmith** 监控，只需配置环境变量即可记录完整的 Agent 决策链路、工具调用参数及 Token 消耗。
 
-## RAG Pipeline
+##  技术栈
 
-### 混合检索（Hybrid Search）
+- **Orchestration**: [LangGraph](https://github.com/langchain-ai/langgraph)
+- **Framework**: [LangChain](https://github.com/langchain-ai/langchain)
+- **Monitoring**: [LangSmith](https://www.langchain.com/langsmith)
+- **Search Engine**: BM25 + Vector (Qdrant)
+- **LLM**: 通义千问 `qwen-plus-2025-12-01`
+- **Hardware**: NVIDIA RTX 4090 (支持 CUDA 加速加速推理与嵌入)
+- **Terminal UI**: [Rich](https://github.com/Textualize/rich)
 
-```
-Query
-  │
-  ├── Multi-query 改写（3个子问题）
-  │
-  ├─▶ BGE-M3 向量检索（Bi-Encoder）× 4路 → 合并去重
-  │
-  ├─▶ BM25 关键词检索（jieba 中文分词）
-  │
-  ├── RRF 算法融合两路排名
-  │
-  ├─▶ BGE-Reranker-v2-m3 精排（Cross-Encoder）→ Top-5
-  │
-  └── Context Expansion（扩展前后相邻 chunk）
-        │
-        ▼
-      返回 Agent
-```
+##  系统架构流程
 
-**为什么采用混合检索：**
+1. **意图解析 (Planner)**：分析问题，判断是否需要调用工具。
+2. **路由寻址 (Router)**：通过 `manifest.json` 匹配最相关的文档。
+3. **混合检索 (Hybrid Search)**：在选定文档中并行执行 BM25 与向量检索。
+4. **答案生成 (Agent)**：融合检索片段生成带引用的回答。
+5. **质量自检 (Evaluator)**：评估回答是否包含幻觉，不合格则返回 Planner 重新执行。
 
-- BGE-M3（Bi-Encoder）：Query 和文档独立编码，向量相似度计算，速度快，适合语义召回
-- BM25：关键词精确匹配，弥补向量检索对专有术语、型号、公式的不足
-- RRF：两路结果排名融合，无需对齐分数量纲，是混合检索的工业标准做法
-- BGE-Reranker-v2-m3（Cross-Encoder）：Query 和文档拼接后做完整 Attention 计算，精度高，只用于精排少量候选
+##  快速开始
 
-**为什么 Multi-query：**
+### 1. 配置环境
+在项目根目录创建 `.env` 文件：
 
-单一 query 召回覆盖率有限，复杂问题容易遗漏相关段落。将原始问题改写为 3 个不同角度的子问题，分别检索后合并去重，再统一精排。
+```env
+# LLM 访问
+OPENAI_API_KEY=your_api_key
+OPENAI_API_BASE=https://...
 
-### 语义分块
+# LangSmith 监控 (建议开启)
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=lsv2_pt_xxxxxxxxxxxxxxxxxxxxxx
+LANGCHAIN_PROJECT=Agentic_RAG_V8
 
-使用 LlamaIndex `SemanticSplitterNodeParser`，自适应百分位数切割：
-
-- `breakpoint_percentile_threshold=95`：只切语义跳跃最突兀的 5% 位置
-- 相比固定阈值，在不同风格文档间无需重新调参
-- 避免关键信息跨 chunk 断裂（Context Fragmentation）
-
-### 向量存储
-
-Qdrant 内存模式，BGE-M3 输出经 L2 归一化后存储。归一化后 Cosine 相似度等价于点积计算，降低检索开销。
-
-> **当前限制**：内存模式不持久化，重启后需重新建索引。单文件单线程，不支持并发。
-
----
-
-## 关键设计决策
-
-### 为什么引入 Planner
-
-初版直接使用绑定工具的 LLM 作为 Agent。实际运行中，当用户提问不涉及 PDF 内容时，LLM 仍会尝试生成工具调用格式的输出，触发 provider 的 `BadRequestError`（Forced Tool Calling 问题）。
-
-引入独立 Planner 节点，使用未绑定工具的 `llm_plain`，将意图判断与工具执行解耦。Planner 只看当前问题，不传入历史消息，避免历史中的工具调用模式干扰判断。
-
-### 为什么 Evaluator 回退到 Planner 而非 Agent
-
-Evaluator 判定质量不合格时，根本原因可能是检索策略本身错误（搜错了方向），而不只是生成质量差。直接回退 Agent 只是重试，不改变检索策略。回退 Planner 让整个决策链重新运行，有机会修正更上游的问题。
-
-### Faithfulness 检验替代自评置信度
-
-原始设计依赖模型自评 `confidence` 字段触发重试，存在自我评估偏差（Self-evaluation Bias）。当前版本引入独立 Evaluator LLM，将回答和检索文档一起传入，判断每个陈述是否有文档依据。通过 `tool_call_id` 精确匹配对应的 `ToolMessage`，而非搜索消息内容字符串。
-
----
-
-## 已知局限
-- 冷启动交互盲区：在 V8 以前的版本中，系统缺乏对知识库全貌的自动感应，导致用户在不熟悉文档内容时难以发起有效提问。
-- 计算资源开销：由于采用实时解析模式，长文档（如 70+ 页论文）的预处理会导致极长的首字响应延迟（TTFT）。
-- 上下文布局噪声：目前的切片算法基于字符顺序而非物理页面布局，处理带有双栏排版或复杂表格的 PDF 时，可能会引入跨列语义干扰。
-
-## 演进路径
-- V8 版本进行中：离线文档库处理
-   - 持久化存储：切换至 `Qdrant` 磁盘持久化模式，支持大规模文档的冷启动秒级加载。
-   - 离线预处理流水线：建立异步 `Ingestion Pipeline`，支持后台自动解析与 `manifest.json` 元数据编目。
-- [V7 - 已完成] 量化评估闭环：
-   - 成功接入 `Ragas` 评测框架，通过 `Faithfulness`（忠实度）、`Answer Relevance`（回答相关性） 等维度对系统进行工业级量化打分。
-
-- [计划中] 智能路由与多代理协同：
-   - Metadata Router：基于文档画像自动锁定目标 `ID`，降低跨文档搜索时的语义噪音。
-   - Long-term Memory：将历史对话向量化存储，实现基于 RAG 的超长历史检索。
-
-- [计划中] 多模态增强：接入图像解析模型，优化对论文中实验图表的理解能力。
----
-
-## 技术栈
-
-| 组件 | 选型 |
-|------|------|
-| Agent 框架 | LangGraph |
-| RAG 框架 | LlamaIndex |
-| Embedding 模型 | BAAI/bge-m3 |
-| Reranker 模型 | BAAI/bge-reranker-v2-m3 |
-| 关键词检索 | BM25Okapi + jieba |
-| 向量数据库 | Qdrant（内存模式） |
-| LLM | Qwen-plus（OpenAI 兼容接口） |
-| PDF 解析 | PyMuPDF |
-| 终端渲染 | Rich |
-| 评测框架 | Ragas |
-
----
-
-## 快速开始
-
-```bash
-git clone https://github.com/APushingBoy/agentic_rag_langgraph.git
-cd agentic-rag-pdf
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 配置 API Key
-cp .env.example .env
-# 编辑 .env，填入 DASHSCOPE_API_KEY
-
-# 运行
-python main.py
-# 根据提示输入 PDF 完整路径
-```
-
----
+# 调试模式
+DEBUG_MODE=true

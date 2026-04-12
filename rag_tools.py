@@ -1,347 +1,361 @@
 import os
+import json
+import pickle
+from typing import List, Dict, Tuple, Optional
+from pathlib import Path
+
 import torch
-from typing import List, Dict, Tuple
 from rank_bm25 import BM25Okapi
 import jieba
 
-# --- [新引入 LlamaIndex 相关组件] ---
-from llama_index.core import VectorStoreIndex, StorageContext, Document, Settings
-from llama_index.core.schema import QueryBundle
-from llama_index.core.node_parser import SemanticSplitterNodeParser
+# LlamaIndex 组件
+from llama_index.core import VectorStoreIndex, Settings
+from llama_index.core.schema import QueryBundle, NodeWithScore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.postprocessor.sbert_rerank import SentenceTransformerRerank
 from llama_index.vector_stores.qdrant import QdrantVectorStore
-from llama_index.readers.file import PyMuPDFReader
 
-# --- [保留原有的工具库] ---
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from qdrant_client import models as qdrant_models
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
+# 这里导入我们在管道中定义的全局索引类，确保架构对齐
+# 如果在一个文件内，请确保 GlobalBM25Index 类在 RAGEngine 之前定义
+from ingestion_pipeline import GlobalBM25Index
+
 # ==========================================
-# 1. 核心 RAG 引擎类 (LlamaIndex 增强版)
+# 配置常量
+# ==========================================
+MANIFEST_PATH = Path("./manifest.json")
+QDRANT_PATH = "./qdrant_storage"
+BM25_INDEX_PATH = Path("./bm25_global_index.pkl")
+LLM_MODEL = "qwen-plus-2025-12-01"
+
+
+# ==========================================
+# 核心 RAG 引擎类 (V8 版本 - 对齐全局索引架构)
 # ==========================================
 class RAGEngine:
-    def __init__(self, file_path: str):
-        self.file_path = file_path
+    def __init__(self):
+        """
+        初始化 RAG 引擎。
+        我在这里不仅加载了向量库，还引入了真·全局 BM25 索引，
+        确保我们的混合检索是基于全量语料库统计的。
+        """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"DEBUG: [RAG 引擎启动] 正在加载模型到 {self.device} (4090 模式)...")
+        print(f"DEBUG: [RAG 引擎启动] 使用设备: {self.device}")
         
-        # claude建议定义一个query_llm
-        self.query_llm = ChatOpenAI(model="qwen-plus", temperature=0)
-        # --- [旧代码：手动加载 SentenceTransformer] ---
-        # self.embed_model = SentenceTransformer(...) 
+        # 1. 初始化 LLM（用于查询扩展和改写）
+        self.query_llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
         
-        # --- [新代码：配置 LlamaIndex 全局模型设置] ---
-        # 使用 HuggingFaceEmbedding 直接对接 BGE-M3，充分利用 4090
+        # 2. 配置 LlamaIndex 全局嵌入模型 (BGE-M3)
+        # 我在初始化时会显式指定设备，避免面试时被问到资源调度问题
         Settings.embed_model = HuggingFaceEmbedding(
             model_name="BAAI/bge-m3",
-            device=self.device,
-            embed_batch_size=128 # 4090 显存大，直接把 Batch Size 开大
+            device=self.device
         )
-        # 注意：LlamaIndex 默认会处理 LLM 节点，如果我们只做检索，可以暂不配置 Settings.llm
-
-        # --- [旧代码：手动初始化 CrossEncoder] ---
-        # self.rerank_model = CrossEncoder(...)
         
-        # --- [新代码：使用 LlamaIndex 内置的 Reranker 插件] ---
+        # 3. 初始化 Qdrant 向量库客户端
+        self.qdrant_client = QdrantClient(path=QDRANT_PATH)
+        self.vector_store = QdrantVectorStore(
+            client=self.qdrant_client,
+            collection_name="expert_collection"
+        )
+        self.index = VectorStoreIndex.from_vector_store(vector_store=self.vector_store)
+        
+        # 4. 加载真·全局 BM25 索引
+        # 这是本次修改的核心：直接加载 ingestion 生成的全局池，不再扫描散装 pkl
+        self.global_bm25 = GlobalBM25Index(BM25_INDEX_PATH)
+        
+        # 5. 初始化重排序模型 (Rerank)
+        # 使用 bge-reranker-v2-m3 能够极大提升 Top-K 召回后的精度
         self.reranker = SentenceTransformerRerank(
             model="BAAI/bge-reranker-v2-m3",
-            top_n=5, # 相当于你原来的 final_results[:5]
+            top_n=5,
             device=self.device
         )
 
-        # 初始化 Qdrant
-        self.client = QdrantClient(":memory:")
-        
-        # --- [新逻辑：初始化数据存储上下文] ---
-        self.vector_store = QdrantVectorStore(
-            client=self.client, 
-            collection_name="expert_collection"
-        )
-        self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
-        
-        # 初始化 BM25 相关
-        self.bm25_index = None
-        self.bm25_corpus = []
-        self.bm25_nodes = []
-        
-        self._process_document()
-
-    def _extract_text(self):
-        """
-        [旧代码：手动使用 MarkItDown]
-        md = MarkItDown()
-        return md.convert(self.file_path).text_content
-        """
-        # [新代码：使用 LlamaIndex 适配器，它能更好地保留元数据]
-        reader = PyMuPDFReader()
-        return reader.load_data(file_path=self.file_path)
-
-    def _process_document(self):
-        print(f"DEBUG: [RAG] 正在解析文档: {os.path.basename(self.file_path)}")
-        
-        # 1. 提取文档
-        documents = self._extract_text() 
-        
-        # 2. 语义切分 (替代原来的 Chonkie 手动切分)
-        # LlamaIndex 的 SemanticSplitter 会自动利用 Settings.embed_model 进行语义聚类切片
-        splitter = SemanticSplitterNodeParser(
-            buffer_size=1, 
-            breakpoint_percentile_threshold=95,
-            embed_model=Settings.embed_model
-        )
-        
-        # --- [旧代码：手动 chunks -> embeddings -> upload_collection] ---
-        # 这部分现在被一行代码取代：索引构建
-        # LlamaIndex 会自动完成：切片、计算向量、批量上传 Qdrant
-        self.index = VectorStoreIndex.from_documents(
-            documents,
-            storage_context=self.storage_context,
-            transformations=[splitter],
-            show_progress=True
-        )
-        
-        # 3. 构建 BM25 索引
-        print(f"DEBUG: [RAG] 正在构建 BM25 索引...")
-        # 获取所有节点
-        self.bm25_nodes = []
-        for doc in documents:
-            nodes = splitter.get_nodes_from_documents([doc])
-            self.bm25_nodes.extend(nodes)
-        
-        # 准备 BM25 语料库
-        self.bm25_corpus = []
-        for node in self.bm25_nodes:
-            # 对中文文本进行分词
-            if any(ord(c) > 127 for c in node.text):
-                tokens = jieba.lcut(node.text)
-            else:
-                tokens = node.text.lower().split()
-            self.bm25_corpus.append(tokens)
-        
-        # 构建 BM25 索引
-        if self.bm25_corpus:
-            self.bm25_index = BM25Okapi(self.bm25_corpus)
-            print(f"DEBUG: [RAG] BM25 索引构建成功，包含 {len(self.bm25_nodes)} 个节点")
-        
-        print(f"DEBUG: [RAG] LlamaIndex 索引构建成功")
-
     def _expand_query(self, query: str) -> List[str]:
         """
-        将原始查询改写成多个子查询
+        利用 LLM 进行查询改写与扩展。
+        我会生成多个维度的子问题，以应对向量检索在复杂表述下的召回不足。
         """
+        print(f"DEBUG: [查询扩展] 原始 Query: {query}")
+        prompt = f"""你是一个搜索专家。请将用户的提问拆解或改写为 3 个不同的搜索短语，
+        以便从知识库中检索到更全面的内容。
+        要求：
+        1. 涵盖原始意图。
+        2. 尝试不同的侧重点（概念、原理、应用）。
+        3. 只输出短语，每行一个。
+
+        用户提问：{query}
+        """
+        
         try:
-            # 创建 LLM 实例 ❌ 每次都创建实例太低效了
-            # llm = ChatOpenAI(model="qwen-plus", temperature=0)
-            
-            # 构建系统提示
-            system_prompt = """
-            你是一个查询改写器。
-            将用户的问题改写成 3 个不同角度的子问题，用于从学术论文中检索不同层面的信息。
-            每个子问题应该关注原问题的不同方面。
-            只输出 JSON 数组：["子问题1", "子问题2", "子问题3"]
-            不要输出任何其他内容。
-            """
-            
-            # 发起调用
-            response = self.query_llm.invoke(system_prompt + f"\n\n原始问题：{query}")
-            
-            # 解析 JSON 结果
-            import json
-            # sub_queries = json.loads(response.content)
-            # 防止千问的回复中包含json相关的markdown代码块的内容
-            content = response.content.strip().replace("```json", "").replace("```", "").strip()
-            sub_queries = json.loads(content)
-            
-            # 确保返回的是列表且长度为 3
-            if isinstance(sub_queries, list) and len(sub_queries) == 3:
-                return sub_queries
-            else:
-                return [query]
+            response = self.query_llm.invoke(prompt)
+            expanded_queries = [line.strip() for line in response.content.split("\n") if line.strip()]
+            # 我一定会把原始查询放在首位，确保基准召回
+            all_queries = [query] + expanded_queries[:2] 
+            return all_queries
         except Exception as e:
-            # 失败时退化为返回原始查询
-            print(f"DEBUG: [RAG] 查询改写失败: {str(e)}")
+            print(f"ERROR: [查询扩展失败] {e}")
             return [query]
 
-    def _bm25_search(self, query: str, top_k: int = 15) -> List[Tuple[float, any]]:
-        """使用 BM25 进行关键词搜索"""
-        if not self.bm25_index:
-            return []
+    def _bm25_search(self, query: str, doc_id: str = "all", top_k: int = 20) -> List[Tuple[float, Any]]:
+        """
+        基于全局 BM25 模型进行关键词检索。
         
-        # 对查询进行分词
+        修改点：
+        1. 不再循环多个文件，而是直接对全局模型打分。
+        2. 支持 doc_id 过滤：如果指定了某个文档，我们会从全局结果中筛选出该文档的节点。
+        """
+        if not self.global_bm25.bm25_model:
+            print("WARNING: [BM25] 全局模型未就绪")
+            return []
+
+        # 分词对齐：中英文分词逻辑必须与 Ingestion 阶段完全一致
         if any(ord(c) > 127 for c in query):
             query_tokens = jieba.lcut(query)
         else:
             query_tokens = query.lower().split()
-        
-        # BM25 搜索
-        scores = self.bm25_index.get_scores(query_tokens)
-        
-        # 排序并返回 Top K
+
+        # 获取全局打分
+        scores = self.global_bm25.bm25_model.get_scores(query_tokens)
+        all_nodes = self.global_bm25.data.get("all_nodes", [])
+
+        # 封装结果并应用 doc_id 过滤
         results = []
         for i, score in enumerate(scores):
             if score > 0:
-                results.append((score, self.bm25_nodes[i]))
-        
+                node = all_nodes[i]
+                # 如果用户限定了文档，则只保留该文档的节点
+                if doc_id != "all" and node.metadata.get("doc_id") != doc_id:
+                    continue
+                results.append((score, node))
+
+        # 按分值排序
         results.sort(key=lambda x: x[0], reverse=True)
         return results[:top_k]
-    
-    def _rrf_merge(self, vector_results: List[any], bm25_results: List[Tuple[float, any]], k: int = 60) -> Tuple[List[any], Dict[str, float]]:
-        """使用 RRF 算法合并向量搜索和 BM25 搜索结果"""
-        # 构建文档到排名的映射
-        doc_rank = {}
+
+    def _expand_context(self, node: Any, doc_id: str) -> str:
+        """
+        上下文扩展：解决 Chunk 截断导致的语义缺失。
+        既然我们有全局节点池，我可以轻松通过元数据找到该节点在原文档中的前后邻居。
+        """
+        # 从全局池中过滤出属于该文档的所有节点，并按顺序排列
+        all_doc_nodes = [
+            n for n in self.global_bm25.data.get("all_nodes", [])
+            if n.metadata.get("doc_id") == doc_id
+        ]
         
-        # 处理向量搜索结果
-        for rank, node in enumerate(vector_results):
-            if node.node_id not in doc_rank:
-                doc_rank[node.node_id] = 0
-            doc_rank[node.node_id] += 1 / (rank + k)
-        
-        # 处理 BM25 搜索结果
-        for rank, (score, node) in enumerate(bm25_results):
-            if node.node_id not in doc_rank:
-                doc_rank[node.node_id] = 0
-            doc_rank[node.node_id] += 1 / (rank + k)
-        
-        # 按 RRF 得分排序
-        sorted_docs = sorted(doc_rank.items(), key=lambda x: x[1], reverse=True)
-        
-        # 构建结果列表
-        node_map = {node.node_id: node for node in vector_results}
-        for _, node in bm25_results:
-            if node.node_id not in node_map:
-                node_map[node.node_id] = node
-        
-        results = []
+        # 寻找当前节点在文档流中的位置
+        try:
+            current_idx = -1
+            for i, n in enumerate(all_doc_nodes):
+                if n.node_id == node.node_id:
+                    current_idx = i
+                    break
+            
+            if current_idx == -1:
+                return node.get_content()
+
+            # 向上向下各取 1 个节点作为缓冲，增强语义完整性
+            start_idx = max(0, current_idx - 1)
+            end_idx = min(len(all_doc_nodes), current_idx + 2)
+            
+            expanded_text = ""
+            for i in range(start_idx, end_idx):
+                prefix = "[...继续上一段...] " if i == current_idx - 1 else ""
+                suffix = " [...接下一段...]" if i == current_idx + 1 else ""
+                content = all_doc_nodes[i].get_content()
+                expanded_text += f"{prefix}{content}{suffix}\n\n"
+            
+            return expanded_text.strip()
+        except Exception as e:
+            print(f"DEBUG: [上下文扩展异常] {e}")
+            return node.get_content()
+
+    def _rrf_merge(self, vector_nodes: List[NodeWithScore], bm25_results: List[Tuple[float, Any]], k: int = 60) -> List[Any]:
+        """
+        互惠排名融合 (Reciprocal Rank Fusion, RRF)。
+        这在面试中是必考点。我用它来平衡向量检索和 BM25 检索的结果。
+        """
         rrf_scores = {}
-        for node_id, score in sorted_docs:
-            if node_id in node_map:
-                node = node_map[node_id]
-                # 确保所有节点都是 NodeWithScore 类型
-                from llama_index.core.schema import NodeWithScore
-                if not isinstance(node, NodeWithScore):
-                    # 创建一个 NodeWithScore 对象
-                    node = NodeWithScore(node=node, score=0.0)
-                results.append(node)
-                rrf_scores[node_id] = score
         
-        return results, rrf_scores
-    
-    def _expand_context(self, node: any, context_size: int = 500) -> str:
-        """扩展节点上下文，包含前后各 500 tokens"""
-        if not self.bm25_nodes:
-            return node.text
+        # 处理向量检索排名
+        for rank, node_with_score in enumerate(vector_nodes):
+            node_id = node_with_score.node.node_id
+            rrf_scores[node_id] = rrf_scores.get(node_id, 0) + 1.0 / (k + rank + 1)
         
-        # 找到当前节点在列表中的位置
-        node_index = -1
-        for i, n in enumerate(self.bm25_nodes):
-            if n.node_id == node.node_id:
-                node_index = i
-                break
+        # 处理 BM25 检索排名
+        for rank, (score, node) in enumerate(bm25_results):
+            node_id = node.node_id
+            rrf_scores[node_id] = rrf_scores.get(node_id, 0) + 1.0 / (k + rank + 1)
         
-        if node_index == -1:
-            return node.text
+        # 汇总去重后的节点字典，方便后续查找
+        node_lookup = {n.node.node_id: n.node for n in vector_nodes}
+        for _, node in bm25_results:
+            if node.node_id not in node_lookup:
+                node_lookup[node.node_id] = node
+                
+        # 按 RRF 分数重排
+        sorted_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
         
-        # 收集前后节点
-        start_idx = max(0, node_index - 2)
-        end_idx = min(len(self.bm25_nodes), node_index + 3)
-        
-        # 合并上下文
-        context_parts = []
-        for i in range(start_idx, end_idx):
-            if i != node_index:
-                context_parts.append(f"[上下文] {self.bm25_nodes[i].text}")
-            else:
-                context_parts.append(f"[核心内容] {self.bm25_nodes[i].text}")
-        
-        return "\n___\n".join(context_parts)
-    
-    def search(self, query: str) -> str:
-        # --- [旧代码：手动计算 query_vector, 调用 query_points, 手动循环 Rerank] ---
-        # 下面是 LlamaIndex 的全自动化链路：
-        
-        # 1. 扩展查询
-        sub_queries = self._expand_query(query)
-        # 包含原始查询
-        all_queries = [query] + sub_queries
-        
-        # 2. 创建检索器
-        retriever = self.index.as_retriever(similarity_top_k=15)
-        
-        # 3. 执行多查询检索（召回阶段）
-        all_nodes = []
-        for q in all_queries:
-            nodes = retriever.retrieve(q)
-            all_nodes.extend(nodes)
-        
-        # 4. 去重
-        unique_nodes = {}
-        for node in all_nodes:
-            if node.node_id not in unique_nodes:
-                unique_nodes[node.node_id] = node
-        vector_nodes = list(unique_nodes.values())
-        
-        # 5. 执行 BM25 搜索
-        bm25_results = self._bm25_search(query, top_k=15)
-        
-        # 6. 使用 RRF 合并结果
-        merged_nodes, rrf_scores = self._rrf_merge(vector_nodes, bm25_results)
-        
-        # 7. 执行精排（Rerank 阶段）
-        # 使用我们 init 时定义的 self.reranker
-        ranked_nodes = self.reranker.postprocess_nodes(merged_nodes, query_bundle=QueryBundle(query_str=query))
-        
-        # 8. 扩展上下文
-        expanded_nodes = []
-        for node in ranked_nodes:
-            expanded_text = self._expand_context(node)
-            expanded_nodes.append(expanded_text)
-        
-        # --- [保留原有的 Debug 输出逻辑] ---
-        print(f"\n{'#'*30} RAG 检索诊断 (LlamaIndex 版) {'#'*30}")
-        print(f" 原始查询: {query}")
-        print(f" 改写子查询: {sub_queries}")
-        print(f" 向量检索 Top 3:")
-        for i, node in enumerate(vector_nodes[:3]):
-            print(f"  [{i}] {node.text[:60]}...")
-        
-        print(f" BM25 检索 Top 3:")
-        for i, (score, node) in enumerate(bm25_results[:3]):
-            print(f"  [{i}] Score: {score:.4f} | {node.text[:60]}...")
-        
-        print(f" RRF 合并后 Top 3:")
-        for i, node in enumerate(merged_nodes[:3]):
-            rrf_score = rrf_scores.get(node.node_id, 0)
-            print(f"  [{i}] RRF Score: {rrf_score:.4f} | {node.text[:60]}...")
-        
-        print(f" 精排阶段 Top 3:")
-        for i, node in enumerate(ranked_nodes[:3]):
-            print(f"  [{i}] Score: {node.score:.4f} | {node.text[:60]}...")
-        print(f"{'#'*75}\n")
+        merged_nodes = []
+        for node_id, _ in sorted_ids:
+            # 统一封装为 NodeWithScore 类型供下游使用
+            merged_nodes.append(NodeWithScore(node=node_lookup[node_id], score=rrf_scores[node_id]))
+            
+        return merged_nodes
 
-        # 返回合并后的文本
-        return "\n___\n".join(expanded_nodes)
+    def search(self, query: str, doc_id: str = "all") -> str:
+        """
+        核心检索入口：多路召回 -> RRF 融合 -> Rerank 重排序 -> 上下文增强。
+        """
+        print(f"\nDEBUG: [开始检索] Query: {query} | Scope: {doc_id}")
+        
+        # 1. 查询扩展
+        queries = self._expand_query(query)
+        
+        all_vector_results = []
+        all_bm25_results = []
+        
+        # 对每一个扩展后的子查询进行检索
+        for q in queries:
+            # --- 向量路 (Vector Path) ---
+            vector_query_filter = None
+            if doc_id != "all":
+                vector_query_filter = qdrant_models.Filter(
+                    must=[qdrant_models.FieldCondition(
+                        key="doc_id", match=qdrant_models.MatchValue(value=doc_id)
+                    )]
+                )
+            
+            # 向量检索召回
+            v_results = self.index.as_retriever(
+                similarity_top_k=15, 
+                vector_store_kwargs={"filter": vector_query_filter}
+            ).retrieve(q)
+            all_vector_results.extend(v_results)
+            
+            # --- BM25 路 (BM25 Path) ---
+            b_results = self._bm25_search(q, doc_id=doc_id, top_k=15)
+            all_bm25_results.extend(b_results)
+            
+        # 2. 混合融合 (RRF)
+        # RRF 会自动处理多轮子查询带来的重复节点
+        merged_nodes = self._rrf_merge(all_vector_results, all_bm25_results)
+        print(f"DEBUG: [多路召回完成] 融合后节点数: {len(merged_nodes)}")
+        
+        # 3. 重排序 (Rerank)
+        # 哪怕召回了一堆，我也只取最相关的 Top-N，宁缺毋滥
+        if merged_nodes:
+            reranked_nodes = self.reranker.postprocess_nodes(merged_nodes, query_bundle=QueryBundle(query_str=query))
+        else:
+            return ""
+            
+        # 4. 上下文扩展与最终文本组装
+        # 我会尝试把检索到的片段与其所在的文档上下文串联起来，使 LLM 回答更准确
+        final_context_blocks = []
+        for i, n_s in enumerate(reranked_nodes):
+            # 获取节点所在的真实 doc_id（防止搜索 all 时来源混乱）
+            actual_doc_id = n_s.node.metadata.get("doc_id", "unknown")
+            source_file = n_s.node.metadata.get("source_file", "未知文件")
+            
+            expanded_content = self._expand_context(n_s.node, actual_doc_id)
+            
+            block = f"--- [来源 {i+1}: {source_file}] ---\n{expanded_content}"
+            final_context_blocks.append(block)
+            
+        return "\n\n".join(final_context_blocks)
+
 
 # ==========================================
-# 2. 定义工具 (保持不变，LangGraph 无感知替换)
+# 单例引擎获取 (确保全局只加载一次显存)
 # ==========================================
-_global_rag_engine = None
+_rag_engine_instance = None
 
-def init_rag_engine(file_path: str):
-    global _global_rag_engine
-    _global_rag_engine = RAGEngine(file_path)
+def get_rag_engine():
+    global _rag_engine_instance
+    if _rag_engine_instance is None:
+        _rag_engine_instance = RAGEngine()
+    return _rag_engine_instance
+
+
+# ==========================================
+# LangChain Tools 定义
+# ==========================================
 
 @tool
-def search_pdf_tool(query: str):
+def rag_search_tool(query: str, doc_id: str = "all"):
     """
-    Search the PDF document for information regarding specific technical terms, 
-    abstracts, or methodologies. Use this whenever the user asks about the 
-    content of the uploaded paper.
+    根据用户问题，从本地知识库中检索高度相关的文档片段。
     
-    支持关键词精确匹配。当用户提到具体的章节标题、页码或带有引号的术语时，必须优先使用此工具。
+    参数：
+    - query: 用户的提问或需要搜索的关键词。
+    - doc_id: 文档 ID。如果设为 "all"，则搜索全库；如果指定具体 ID，则仅搜索该文档。
+    
+    返回：
+    - 检索到的相关文本片段，按相关性排序，带有来源标识。
     """
-    if _global_rag_engine is None:
-        return "错误：RAG 引擎未初始化。"
-    return _global_rag_engine.search(query)
+    engine = get_rag_engine()
+    result = engine.search(query, doc_id)
+    
+    if not result or result.strip() == "":
+        return "【检索结果为空】在当前知识库中未找到相关内容，建议尝试更换关键词或搜索全库。"
+    
+    return result
+
+
+@tool
+def list_docs_tool():
+    """
+    获取当前知识库的完整文档概览列表。
+    
+    使用场景：
+    - 确认当前加载了哪些文档。
+    - 用户询问"你有关于什么的资料"或"有哪些 PDF"时。
+    
+    返回：
+    - JSON 格式的文档列表。
+    """
+    if not MANIFEST_PATH.exists():
+        return json.dumps({
+            "status": "empty",
+            "message": "文档库暂时没有内容。请先运行 ingestion_pipeline.py 导入文档。",
+            "documents": []
+        }, ensure_ascii=False)
+    
+    try:
+        with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        
+        # 抽取核心元数据，方便 Agent 决策
+        simplified = []
+        for doc in manifest:
+            simplified.append({
+                "doc_id": doc.get("doc_id", "unknown"),
+                "title": doc.get("title", "Untitled"),
+                "summary": doc.get("summary", ""),
+                "key_points": doc.get("key_points", [])
+            })
+        
+        return json.dumps({
+            "status": "success",
+            "count": len(simplified),
+            "documents": simplified
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"ERROR: 读取文档库清单失败 - {e}"
+
+# ==========================================
+# 调试入口
+# ==========================================
+if __name__ == "__main__":
+    # 快速冒烟测试
+    engine = get_rag_engine()
+    test_query = "什么是 DPO 训练？"
+    res = engine.search(test_query)
+    print("\n--- 最终检索预览 ---")
+    print(res[:500] + "...")
